@@ -1,82 +1,127 @@
-"""
-Simple FastAPI app serving a text classification scikit-learn model.
-
-Run locally:
-    python -m uvicorn main:app --reload
-
-Open Swagger UI:
-    http://127.0.0.1:8000/docs
-"""
-
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 import joblib
 import os
 
+MODEL_PATH = os.path.join(os.path.dirname(__file__), "model.pkl")
 
-MODEL_PATH = os.path.join(
-    os.path.dirname(__file__),
-    "model.pkl"
-)
+app = FastAPI(title="Sentiment Analysis API")
 
-
-app = FastAPI(
-    title="Getting Started with ML in Production API",
-    description="A minimal text classification prediction API built for the workshop.",
-    version="1.0.0",
-)
-
-
-# Load the model once at startup
 try:
-    model = joblib.load(MODEL_PATH)
+    pipeline = joblib.load(MODEL_PATH)
 except FileNotFoundError:
-    model = None
+    pipeline = None
 
+class SentimentRequest(BaseModel):
+    text: str = Field(..., min_length=1, description="Review text to analyze")
 
-class PredictionRequest(BaseModel):
-    text: str = Field(
-        ...,
-        min_length=1,
-        description="Text that the machine learning model should classify."
-    )
-
-
-class PredictionResponse(BaseModel):
-    prediction: int
-    class_name: str
-
+class SentimentResponse(BaseModel):
+    sentiment: str
+    confidence: float | None = None
 
 @app.get("/")
 def root():
-    return {
-        "message": "Workshop ML API is running. See /docs for usage."
-    }
-
+    return {"message": "Sentiment API is running. See /docs for usage."}
 
 @app.get("/health")
 def health():
-    """Basic health check endpoint."""
-    return {
-        "status": "ok",
-        "model_loaded": model is not None
+    return {"status": "ok", "model_loaded": pipeline is not None}
+
+@app.post("/predict", response_model=SentimentResponse)
+def predict(request: SentimentRequest):
+    if pipeline is None:
+        raise HTTPException(status_code=503, detail="Model not loaded.")
+
+    pred = pipeline.predict([request.text])[0]
+    label = "positive" if pred == 1 else "negative"
+
+    confidence = None
+    if hasattr(pipeline, "predict_proba"):
+        confidence = float(pipeline.predict_proba([request.text]).max())
+
+    return SentimentResponse(sentiment=label, confidence=confidence)
+
+import logging
+import time
+import json
+from datetime import datetime, timezone
+
+from fastapi import FastAPI, Request
+
+# --- Basic logging setup -----------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(message)s",
+)
+logger = logging.getLogger("ml_api")
+
+
+def log_prediction_event(request_body: dict, prediction: dict, latency_ms: float):
+    """Log a single prediction event as structured JSON.
+
+    In a real production system, this would go to a log aggregator
+    (e.g., CloudWatch, Datadog, ELK) rather than stdout — but the
+    structured format is the same idea.
+    """
+    event = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "input": request_body,
+        "output": prediction,
+        "latency_ms": round(latency_ms, 2),
     }
+    logger.info(json.dumps(event))
 
 
-@app.post("/predict", response_model=PredictionResponse)
-def predict(request: PredictionRequest):
+def add_monitoring_middleware(app: FastAPI):
+    """Attach a middleware that times every request and logs basic metrics."""
 
-    if model is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Model not loaded. Check that model.pkl exists."
-        )
+    @app.middleware("http")
+    async def monitor_requests(request: Request, call_next):
+        start = time.perf_counter()
+        response = await call_next(request)
+        latency_ms = (time.perf_counter() - start) * 1000
 
-    # The model contains a TfidfVectorizer,
-    # so it expects text rather than numerical features.
-    pred = int(model.predict([request.text])[0])
+        logger.info(json.dumps({
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "path": request.url.path,
+            "method": request.method,
+            "status_code": response.status_code,
+            "latency_ms": round(latency_ms, 2),
+        }))
 
-    return PredictionResponse(
-        prediction=pred,
-        class_name=f"class_{pred}"
-    )
+        return response
+
+    return app
+
+
+from fastapi.responses import HTMLResponse
+
+@app.get("/test", response_class=HTMLResponse)
+def test_page():
+    return """
+    <!DOCTYPE html>
+    <html>
+    <head><title>Sentiment Tester</title></head>
+    <body style="font-family: sans-serif; max-width: 500px; margin: 60px auto;">
+      <h2>Sentiment Analyzer</h2>
+      <textarea id="text" rows="4" style="width:100%; font-size:16px;"
+                placeholder="Type a sentence..."></textarea><br><br>
+      <button onclick="predict()" style="padding:8px 16px; font-size:16px;">Predict</button>
+      <h3 id="result" style="margin-top:20px;"></h3>
+
+      <script>
+        async function predict() {
+          const text = document.getElementById("text").value;
+          const res = await fetch("/predict", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({text: text})
+          });
+          const data = await res.json();
+          document.getElementById("result").innerText =
+            data.sentiment + " (confidence: " + (data.confidence ?? "n/a") + ")";
+        }
+      </script>
+    </body>
+    </html>
+    """
